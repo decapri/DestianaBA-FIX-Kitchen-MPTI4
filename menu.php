@@ -1,5 +1,14 @@
 
 <?php
+// session_start();
+
+// // Check if user is logged in and has kitchen role
+// if (!isset($_SESSION['user_id']) || $_SESSION['role_id'] != 2) {
+//     header('Location: login.php');
+//     exit;
+// }
+
+
 include 'config.php';
 
 // Initialize menu_varian data for drinks if not exists
