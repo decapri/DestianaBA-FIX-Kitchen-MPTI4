@@ -1,102 +1,246 @@
 <?php
-// Include config
+// session_start();
+
+// // Check if user is logged in and has kitchen role
+// if (!isset($_SESSION['user_id']) || $_SESSION['role_id'] != 2) {
+//     header('Location: login.php');
+//     exit;
+// }
+
 include 'config.php';
 
-// Handle status updates
+/* ==============================
+   HANDLE UPDATE STATUS PESANAN
+================================ */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
-    $order_id = $_POST['order_id'];
-    $new_status_id = $_POST['new_status_id'];
-    
-    $stmt = $koneksi->prepare("UPDATE orders SET status_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+
+    $order_id       = (int) $_POST['order_id'];
+    $new_status_id  = (int) $_POST['new_status_id'];
+    $old_status_id  = isset($_POST['old_status_id']) ? (int) $_POST['old_status_id'] : null;
+
+    // Update status order
+    $stmt = $koneksi->prepare(
+        "UPDATE orders 
+         SET status_id = ?, updated_at = CURRENT_TIMESTAMP 
+         WHERE id = ?"
+    );
     $stmt->bind_param("ii", $new_status_id, $order_id);
     $stmt->execute();
     $stmt->close();
-    
-    header('Location: ' . $_SERVER['PHP_SELF'] . (isset($_GET['filter']) ? '?filter=' . $_GET['filter'] : ''));
+
+    // Kurangi stok SAAT status berubah ke DIMASAK (2)
+    if ($new_status_id === 2 && $old_status_id !== 2) {
+
+        $detail_stmt = $koneksi->prepare(
+            "SELECT menu_id, jumlah 
+             FROM order_details 
+             WHERE order_id = ?"
+        );
+        $detail_stmt->bind_param("i", $order_id);
+        $detail_stmt->execute();
+        $detail_result = $detail_stmt->get_result();
+
+        while ($item = $detail_result->fetch_assoc()) {
+            $stock_stmt = $koneksi->prepare(
+                "UPDATE menu 
+                 SET stok = GREATEST(0, stok - ?) 
+                 WHERE id = ?"
+            );
+            $stock_stmt->bind_param("ii", $item['jumlah'], $item['menu_id']);
+            $stock_stmt->execute();
+            $stock_stmt->close();
+        }
+
+        $detail_stmt->close();
+    }
+
+    header("Location: " . $_SERVER['PHP_SELF'] . "?filter=" . ($_GET['filter'] ?? 'all'));
     exit;
 }
 
-// Get filter
-$filter = isset($_GET['filter']) ? $_GET['filter'] : 'all';
+/* ==============================
+   FILTER & PARAMETER
+================================ */
+$filter = $_GET['filter'] ?? 'all';
 
-// Build query based on filter
-$query = "SELECT o.*, so.nama_status, m.nomor_meja 
-          FROM orders o 
-          LEFT JOIN status_order so ON o.status_id = so.id 
-          LEFT JOIN meja m ON o.meja_id = m.id 
-          WHERE 1=1";
+$start_date = $_GET['start_date'] ?? date('Y-m-d', strtotime('-30 days'));
+$end_date   = $_GET['end_date']   ?? date('Y-m-d');
+$start_time = $_GET['start_time'] ?? '00:00';
+$end_time   = $_GET['end_time']   ?? '23:59';
 
+/* ==============================
+   QUERY PESANAN (DINAMIS)
+================================ */
+$query = "
+    SELECT o.*, so.nama_status, m.nomor_meja
+    FROM orders o
+    LEFT JOIN status_order so ON o.status_id = so.id
+    LEFT JOIN meja m ON o.meja_id = m.id
+    WHERE 1=1
+";
+
+$params = [];
+$types  = "";
+
+/* Filter status */
 if ($filter !== 'all') {
-    $query .= " AND o.status_id = " . intval($filter);
+    $query  .= " AND o.status_id = ?";
+    $params[] = (int) $filter;
+    $types   .= "i";
 }
+
+/* Filter tanggal & waktu KHUSUS status SELESAI */
+if ($filter === '4') {
+    $query .= "
+        AND DATE(o.tanggal_order) BETWEEN ? AND ?
+        AND TIME(o.tanggal_order) BETWEEN ? AND ?
+    ";
+    $params[] = $start_date;
+    $params[] = $end_date;
+    $params[] = $start_time;
+    $params[] = $end_time;
+    $types   .= "ssss";
+}
+
 $query .= " ORDER BY o.tanggal_order DESC";
 
-$result = $koneksi->query($query);
-$orders = [];
-if ($result) {
-    while ($row = $result->fetch_assoc()) {
-        $orders[] = $row;
-    }
+/* ==============================
+   EXECUTE QUERY (AMAN)
+================================ */
+$stmt = $koneksi->prepare($query);
+
+if (!empty($types)) {
+    $stmt->bind_param($types, ...$params);
 }
 
-// Count orders by status
+$stmt->execute();
+$result = $stmt->get_result();
+
+$orders = [];
+while ($row = $result->fetch_assoc()) {
+    $orders[] = $row;
+}
+$stmt->close();
+
+/* ==============================
+   HITUNG JUMLAH STATUS
+================================ */
 $status_counts = [
     'all' => 0,
-    '1' => 0,  // Baru
-    '2' => 0,  // Dimasak
-    '3' => 0,  // Siap dihidangkan
-    '4' => 0   // Selesai
+    '1' => 0,
+    '2' => 0,
+    '3' => 0,
+    '4' => 0
 ];
 
-$count_result = $koneksi->query("SELECT status_id, COUNT(*) as count FROM orders GROUP BY status_id");
+$count_result = $koneksi->query(
+    "SELECT status_id, COUNT(*) AS total 
+     FROM orders 
+     GROUP BY status_id"
+);
+
 if ($count_result) {
     while ($row = $count_result->fetch_assoc()) {
-        $status_counts[$row['status_id']] = $row['count'];
-        $status_counts['all'] += $row['count'];
+        $status_counts[$row['status_id']] = $row['total'];
+        $status_counts['all'] += $row['total'];
     }
 }
 
-// Get order details function
+/* ==============================
+   FUNCTION DETAIL PESANAN
+================================ */
 function getOrderDetails($koneksi, $order_id) {
-    $stmt = $koneksi->prepare("
-        SELECT od.*, m.nama_menu 
-        FROM order_details od 
-        JOIN menu m ON od.menu_id = m.id 
-        WHERE od.order_id = ?
-    ");
+    $stmt = $koneksi->prepare(
+        "SELECT od.*, m.nama_menu
+         FROM order_details od
+         JOIN menu m ON od.menu_id = m.id
+         WHERE od.order_id = ?"
+    );
     $stmt->bind_param("i", $order_id);
     $stmt->execute();
+
     $result = $stmt->get_result();
     $details = [];
+
     while ($row = $result->fetch_assoc()) {
         $details[] = $row;
     }
+
     $stmt->close();
     return $details;
 }
 ?>
+
 
 <!DOCTYPE html>
 <html lang="id">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kopi Janti - Order List Kitchen</title>
+    <title>Kopi Janti - Dashboard Kitchen</title>
     <style>
-
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
 
+        /* ================= FILTER HISTORI ================= */
+
+.filter-section {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    padding: 5px;
+    border-radius: 20px;
+    margin-bottom: 30px;
+    flex-wrap: wrap;
+}
+
+.filter-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.filter-label {
+    font-weight: 600;
+    color: #5d4037;
+}
+
+.date-input,
+.time-input {
+    padding: 10px 14px;
+    border-radius: 20px;
+    border: none;
+    outline: none;
+    font-size: 14px;
+}
+
+.filter-actions {
+    margin-left: auto;   
+    display: flex;
+    align-items: center;
+}
+
+.btn-icon {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    border: none;
+    background: white;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #f5e6d3 0%, #e8d4c0 100%);
             min-height: 100vh;
             padding: 20px;
-            font-variant-emoji: text;
-            
         }
 
         .sidebar {
@@ -112,6 +256,7 @@ function getOrderDetails($koneksi, $order_id) {
             padding: 30px 0;
             gap: 14px;
             box-shadow: 2px 0 10px rgba(0,0,0,0.1);
+            z-index: 100;
         }
 
         .nav-item {
@@ -140,6 +285,12 @@ function getOrderDetails($koneksi, $order_id) {
             font-weight: 500;
         }
 
+        .nav-icon img {
+            width: 24px;
+            height: 24px;
+            filter: grayscale(100%) brightness(0) saturate(100%);
+        }
+
         .main-content {
             margin-left: 120px;
         }
@@ -151,28 +302,11 @@ function getOrderDetails($koneksi, $order_id) {
             margin-bottom: 30px;
         }
 
-        .logo-header {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-
-        .logo-icon {
-            width: 60px;
-            height: 60px;
-            border-radius: 50%;
-        }
-
-        .logo-text {
-            font-size: 14px;
-            font-weight: 600;
-            color: #3e2723;
-        }
-
-        h1 {
+        .header-left h1 {
             font-size: 48px;
             color: #3e2723;
             font-weight: 700;
+            margin-bottom: 5px;
         }
 
         .search-bar {
@@ -192,6 +326,11 @@ function getOrderDetails($koneksi, $order_id) {
             justify-content: center;
             cursor: pointer;
             position: relative;
+            transition: all 0.3s;
+        }
+
+        .notification-btn:hover {
+            transform: scale(1.1);
         }
 
         .notification-badge {
@@ -220,29 +359,18 @@ function getOrderDetails($koneksi, $order_id) {
             border: none;
             border-radius: 25px;
             background: white;
-            width: 200px;
+            width: 250px;
             font-size: 14px;
         }
 
         .search-icon {
             position: absolute;
-            right: 10px;
+            right: 12px;
             top: 50%;
             transform: translateY(-50%);
             width: 20px;
             height: 20px;
-            pointer-events: none;
-        }
-
-        /* Monochrome icon helper: convert UI icons to black-and-white */
-        .icon-mono {
             filter: grayscale(100%) brightness(0) saturate(100%);
-            /* keep natural size and preserve transparency */
-        }
-
-        /* Use inverted monochrome on dark backgrounds if needed */
-        .icon-mono.invert {
-            filter: grayscale(100%) brightness(0) invert(1) saturate(100%);
         }
 
         .filters {
@@ -290,7 +418,7 @@ function getOrderDetails($koneksi, $order_id) {
 
         .orders-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
             gap: 25px;
             margin-bottom: 40px;
         }
@@ -300,12 +428,13 @@ function getOrderDetails($koneksi, $order_id) {
             border-radius: 20px;
             padding: 20px;
             box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-            transition: transform 0.3s;
+            transition: all 0.3s;
             cursor: pointer;
         }
 
         .order-card:hover {
             transform: translateY(-5px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.15);
         }
 
         .order-card-header {
@@ -314,11 +443,11 @@ function getOrderDetails($koneksi, $order_id) {
             align-items: flex-start;
             margin-bottom: 12px;
             padding-bottom: 12px;
-            border-bottom: 1px solid #e0e0e0;
+            border-bottom: 2px solid #f0f0f0;
         }
 
         .customer-name {
-            font-size: 16px;
+            font-size: 18px;
             font-weight: 700;
             color: #3e2723;
             margin-bottom: 5px;
@@ -327,17 +456,21 @@ function getOrderDetails($koneksi, $order_id) {
         .order-number {
             font-size: 15px;
             font-weight: 600;
-            color: #666;
+            color: #8d6e63;
         }
 
         .order-type-badge {
-            font-size: 11px;
+            font-size: 12px;
             color: #666;
-            margin-top: 2px;
+            background: #f5f5f5;
+            padding: 4px 10px;
+            border-radius: 12px;
+            margin-top: 4px;
+            display: inline-block;
         }
 
         .order-info {
-            font-size: 12px;
+            font-size: 13px;
             color: #666;
             margin-bottom: 3px;
         }
@@ -371,12 +504,19 @@ function getOrderDetails($koneksi, $order_id) {
             margin-left: 10px;
         }
 
+        .item-notes {
+            font-size: 12px;
+            color: #999;
+            font-style: italic;
+            margin-top: 2px;
+        }
+
         .see-more {
             text-align: center;
-            color: #666;
+            color: #8d6e63;
             font-size: 12px;
             margin: 8px 0;
-            text-decoration: underline;
+            font-weight: 600;
             cursor: pointer;
         }
 
@@ -396,23 +536,23 @@ function getOrderDetails($koneksi, $order_id) {
         }
 
         .status-btn-single.baru {
-            background: #a8d5f7;
+            background: #e3f2fd;
             color: #1565c0;
         }
 
         .status-btn-single.dimasak {
-            background: #ffe0b2;
-            color: #d84315;
+            background: #fff3e0;
+            color: #e65100;
         }
 
         .status-btn-single.siap {
-            background: #b3e5fc;
-            color: #0277bd;
+            background: #e8f5e9;
+            color: #2e7d32;
         }
 
         .status-btn-single.selesai {
-            background: #c8e6c9;
-            color: #2e7d32;
+            background: #f3e5f5;
+            color: #6a1b9a;
         }
 
         .modal {
@@ -435,11 +575,19 @@ function getOrderDetails($koneksi, $order_id) {
         .modal-content {
             background: white;
             border-radius: 20px;
-            padding: 25px;
-            max-width: 400px;
+            padding: 0;
+            max-width: 500px;
             width: 90%;
-            max-height: 80vh;
+            max-height: 85vh;
             overflow-y: auto;
+            position: relative;
+        }
+
+        .modal-header {
+            background: #8d6e63;
+            color: white;
+            padding: 25px;
+            border-radius: 20px 20px 0 0;
             position: relative;
         }
 
@@ -447,13 +595,13 @@ function getOrderDetails($koneksi, $order_id) {
             position: absolute;
             top: 15px;
             right: 15px;
-            font-size: 24px;
+            font-size: 28px;
             cursor: pointer;
             border: none;
-            background: none;
-            color: #666;
-            width: 30px;
-            height: 30px;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            width: 35px;
+            height: 35px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -462,115 +610,120 @@ function getOrderDetails($koneksi, $order_id) {
         }
 
         .close-modal:hover {
-            background: #f0f0f0;
-        }
-
-        .modal-header {
-            margin-bottom: 15px;
-            padding-bottom: 15px;
-            padding-top: 20px;
-            border-bottom: 2px solid #e0e0e0;
+            background: rgba(255,255,255,0.3);
+            transform: scale(1.1);
         }
 
         .modal-customer-name {
-            font-size: 18px;
+            font-size: 22px;
             font-weight: 700;
-            color: #3e2723;
-            margin-bottom: 5px;
+            margin-bottom: 8px;
+            padding-right: 40px;
         }
 
         .modal-order-number {
-            font-size: 15px;
-            font-weight: 600;
-            color: #666;
-            float: right;
-            margin-top: -25px;
+            font-size: 16px;
+            opacity: 0.9;
+            margin-bottom: 5px;
         }
 
-        .modal-type-badge {
-            display: inline-block;
-            font-size: 11px;
-            color: #666;
-            background: #f5f5f5;
-            padding: 3px 8px;
-            border-radius: 5px;
-            margin-top: 5px;
+        .modal-body {
+            padding: 25px;
+        }
+
+        .modal-info-section {
+            background: #f8f8f8;
+            padding: 15px;
+            border-radius: 12px;
+            margin-bottom: 20px;
         }
 
         .modal-info {
-            font-size: 12px;
+            font-size: 13px;
             color: #666;
-            margin-bottom: 3px;
+            margin-bottom: 5px;
+        }
+
+        .modal-info strong {
+            color: #3e2723;
         }
 
         .modal-items {
-            margin: 15px 0;
+            margin: 20px 0;
+        }
+
+        .total-section {
+            border-top: 2px solid #e0e0e0;
+            padding-top: 15px;
+            margin-top: 15px;
+        }
+
+        .total-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 8px;
         }
 
         .total-price {
-            border-top: 2px solid #e0e0e0;
-            padding-top: 12px;
-            margin-top: 12px;
             display: flex;
             justify-content: space-between;
-            font-size: 16px;
+            font-size: 20px;
             font-weight: 700;
             color: #3e2723;
+            padding-top: 10px;
+            border-top: 2px solid #3e2723;
         }
 
         .status-actions {
             display: flex;
-            gap: 8px;
-            margin-top: 15px;
+            gap: 10px;
+            margin-top: 20px;
             flex-wrap: wrap;
         }
 
         .status-action-btn {
             flex: 1;
             min-width: 100px;
-            padding: 10px;
+            padding: 12px;
             border: none;
             border-radius: 10px;
             cursor: pointer;
-            font-size: 13px;
+            font-size: 14px;
             font-weight: 600;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
             transition: all 0.3s;
         }
 
         .status-action-btn.dimasak {
-            background: #ffe0b2;
-            color: #d84315;
+            background: #fff3e0;
+            color: #e65100;
         }
 
         .status-action-btn.siap {
-            background: #b3e5fc;
-            color: #0277bd;
-        }
-
-        .status-action-btn.selesai {
-            background: #c8e6c9;
+            background: #e8f5e9;
             color: #2e7d32;
         }
 
-        .status-action-btn:hover {
-            opacity: 0.8;
-            transform: scale(1.05);
+        .status-action-btn.selesai {
+            background: #f3e5f5;
+            color: #6a1b9a;
         }
 
-        .btn-simpan {
-            background: #a8d5f7;
-            color: #1565c0;
-            margin-top: 10px;
+        .status-action-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
         }
 
         .empty-state {
             text-align: center;
             padding: 60px 20px;
             color: #999;
+        }
+
+        .empty-state-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
         }
 
         .empty-state-text {
@@ -599,13 +752,14 @@ function getOrderDetails($koneksi, $order_id) {
                 grid-template-columns: 1fr;
             }
 
-            h1 {
+            .header-left h1 {
                 font-size: 32px;
             }
 
             .header {
                 flex-direction: column;
                 gap: 15px;
+                align-items: flex-start;
             }
         }
     </style>
@@ -616,40 +770,35 @@ function getOrderDetails($koneksi, $order_id) {
             <img src="assets/logo.png" alt="Kopi Janti" style="width: 70px; height: 70px;">
         </div>
         <a href="dashboard_kitchen.php" class="nav-item active">
-            <img src="assets/Home.png" alt="Home" class="icon-mono" style="width: 20px; height: 20px;">
+            <div class="nav-icon"><img src="assets/Home.png" alt="Home"></div>
             <div class="nav-label">Home</div>
         </a>
         <a href="menu.php" class="nav-item">
-            <img src="assets/menu.png" alt="Menu" class="icon-mono" style="width: 20px; height: 20px;">
+            <div class="nav-icon"><img src="assets/menu.png" alt="Menu"></div>
             <div class="nav-label">Menu</div>
         </a>
-        <a href="history.php" class="nav-item">
-            <img src="assets/histori.png" alt="History" class="icon-mono" style="width: 20px; height: 20px;">
-            <div class="nav-label">History</div>
-        </a>
         <a href="logout.php" class="nav-item end">
-            <img src="assets/logout.png" alt="Logout" class="icon-mono" style="width: 20px; height: 20px;">
-            <div class="nav-label">Log Out</div>
+            <div class="nav-icon"><img src="assets/logout.png" alt="Logout"></div>
+            <div class="nav-label">Logout</div>
         </a>
     </div>
 
     <div class="main-content">
         <div class="header">
-            <div class="logo-header">
-                <div>
-                    <h1>Order List</h1>
-                </div>
+            <div class="header-left">
+                <h1>Order List</h1>
+               
             </div>
             <div class="search-bar">
                 <button class="notification-btn">
-                    <img src="assets/Bell.png" alt="Notifications" class="icon-mono" style="width: 20px; height: 20px;">
+                    <img src="assets/Bell.png" alt="Notifications" style="width: 20px; height: 20px;">
                     <?php if ($status_counts['1'] > 0): ?>
                         <span class="notification-badge"><?= $status_counts['1'] ?></span>
                     <?php endif; ?>
                 </button>
                 <div class="search-wrapper">
-                    <input type="text" class="search-input" placeholder="Value">
-                    <img src="assets/Search.png" alt="Search" class="search-icon icon-mono">
+                    <input type="text" class="search-input" placeholder="Cari pesanan...">
+                    <img src="assets/Search.png" alt="Search" class="search-icon">
                 </div>
             </div>
         </div>
@@ -665,16 +814,42 @@ function getOrderDetails($koneksi, $order_id) {
                 Dimasak <span class="count"><?= $status_counts['2'] ?></span>
             </a>
             <a href="?filter=3" class="filter-btn <?= $filter === '3' ? 'active' : '' ?>">
-                Siap dihidangkan <span class="count"><?= $status_counts['3'] ?></span>
+                Siap Dihidangkan <span class="count"><?= $status_counts['3'] ?></span>
             </a>
             <a href="?filter=4" class="filter-btn <?= $filter === '4' ? 'active' : '' ?>">
                 Selesai <span class="count"><?= $status_counts['4'] ?></span>
             </a>
         </div>
 
+<?php if ($filter === '4'): ?>
+<form method="GET" class="filter-section">
+    <input type="hidden" name="filter" value="4">
+
+    <div class="filter-group">
+        <span class="filter-label">Tanggal:</span>
+        <input type="date" name="start_date" value="<?= $start_date ?>" class="date-input">
+        <span>-</span>
+        <input type="date" name="end_date" value="<?= $end_date ?>" class="date-input">
+    </div>
+
+    <div class="filter-group">
+        <span class="filter-label">Waktu:</span>
+        <input type="time" name="start_time" value="<?= $start_time ?>" class="time-input">
+        <span>-</span>
+        <input type="time" name="end_time" value="<?= $end_time ?>" class="time-input">
+    </div>
+
+    <div class="filter-actions">
+        <button type="submit" class="btn-icon">
+            <img src="assets/filter.png" width="20">
+        </button>
+    </div>
+</form>
+<?php endif; ?>
+
         <?php if (empty($orders)): ?>
             <div class="empty-state">
-                <div class="empty-state-text">Tidak ada pesanan</div>
+                <div class="empty-state-text">Tidak ada pesanan untuk ditampilkan</div>
             </div>
         <?php else: ?>
             <div class="orders-grid">
@@ -687,120 +862,143 @@ function getOrderDetails($koneksi, $order_id) {
                         <div class="order-card-header">
                             <div>
                                 <div class="customer-name"><?= htmlspecialchars($order['nama_pelanggan'] ?: 'Guest') ?></div>
-                                <div class="order-info">⏰ <?= date('d/m/Y, H:i', strtotime($order['tanggal_order'])) ?></div>
+                                <div class="order-info"><?= date('d/m/Y, H:i', strtotime($order['tanggal_order'])) ?></div>
                                 <?php if ($order['tipe_order'] === 'Dine In' && $order['nomor_meja']): ?>
-                                    <div class="order-info">No Meja: <?= htmlspecialchars($order['nomor_meja']) ?></div>
+                                    <div class="order-info">Meja: <?= htmlspecialchars($order['nomor_meja']) ?></div>
                                 <?php endif; ?>
                             </div>
-                            <div>
+                            <div style="text-align: right;">
                                 <div class="order-number">#<?= htmlspecialchars($order['nomor_struk']) ?></div>
                                 <div class="order-type-badge"><?= $order['tipe_order'] ?></div>
                             </div>
                         </div>
 
                         <div class="order-items-section">
-                            <div class="order-title">Order (<?= $item_count ?>)</div>
+                            <div class="order-title">Pesanan (<?= $item_count ?>)</div>
                             <?php foreach (array_slice($details, 0, 3) as $item): ?>
                                 <div class="order-item">
                                     <div class="item-name"><?= $item['jumlah'] ?>x <?= htmlspecialchars($item['nama_menu']) ?></div>
-                                    <div class="item-price">Rp. <?= number_format($item['harga_satuan'], 0, ',', '.') ?></div>
+                                    <div class="item-price">Rp <?= number_format($item['harga_satuan'], 0, ',', '.') ?></div>
                                 </div>
+                                <?php if (!empty($item['catatan'])): ?>
+                                    <div class="item-notes">Catatan: <?= htmlspecialchars($item['catatan']) ?></div>
+                                <?php endif; ?>
                             <?php endforeach; ?>
                             <?php if ($item_count > 3): ?>
-                                <div class="see-more">See More</div>
+                                <div class="see-more">Lihat Detail</div>
                             <?php endif; ?>
                         </div>
 
                         <?php
                             $status_class = '';
                             $status_text = '';
-                            $status_icon = '';
 
-                            
-// 🔧 DIUBAH: emoji dibungkus agar hitam putih
-if ($order['status_id'] == 1) {
-    $status_class = 'baru';
-    $status_icon = '<span class="emoji">✨</span>';
-    $status_text = 'Baru';
-} elseif ($order['status_id'] == 2) {
-    $status_class = 'dimasak';
-    $status_icon = '<span class="emoji">🍳</span>';
-    $status_text = 'Dimasak';
-} elseif ($order['status_id'] == 3) {
-    $status_class = 'siap';
-    $status_icon = '<span class="emoji">🏠</span>';
-    $status_text = 'Siap dihidangkan';
-} else {
-    $status_class = 'selesai';
-    $status_icon = '<span class="emoji">✓</span>';
-    $status_text = 'Selesai';
-}
-?>
+                            if ($order['status_id'] == 1) {
+                                $status_class = 'baru';
+                                $status_text = 'Pesanan Baru';
+                            } elseif ($order['status_id'] == 2) {
+                                $status_class = 'dimasak';
+                                $status_text = 'Sedang Dimasak';
+                            } elseif ($order['status_id'] == 3) {
+                                $status_class = 'siap';
+                                $status_text = 'Siap Dihidangkan';
+                            } else {
+                                $status_class = 'selesai';
+                                $status_text = 'Selesai';
+                            }
+                        ?>
 
                         <div class="status-btn-single <?= $status_class ?>">
-                            <?= $status_icon ?> <?= $status_text ?>
+                            <?= $status_text ?>
                         </div>
                     </div>
 
                     <!-- Modal for this order -->
                     <div class="modal" id="modal-<?= $order['id'] ?>" onclick="event.target === this && closeModal(<?= $order['id'] ?>)">
                         <div class="modal-content" onclick="event.stopPropagation()">
-                            <button class="close-modal" onclick="closeModal(<?= $order['id'] ?>)">×</button>
-                            
                             <div class="modal-header">
+                                <button class="close-modal" onclick="closeModal(<?= $order['id'] ?>)">×</button>
                                 <div class="modal-customer-name"><?= htmlspecialchars($order['nama_pelanggan'] ?: 'Guest') ?></div>
-                                <div class="modal-order-number">#<?= htmlspecialchars($order['nomor_struk']) ?></div>
-                                <div class="modal-type-badge"><?= $order['tipe_order'] ?></div>
-                                <div class="modal-info">⏰ <?= date('d/m/Y, H:i', strtotime($order['tanggal_order'])) ?></div>
-                                <?php if ($order['tipe_order'] === 'Dine In' && $order['nomor_meja']): ?>
-                                    <div class="modal-info">No Meja: <?= htmlspecialchars($order['nomor_meja']) ?></div>
-                                <?php endif; ?>
+                                <div class="modal-order-number">Order #<?= htmlspecialchars($order['nomor_struk']) ?></div>
                             </div>
+                            
+                            <div class="modal-body">
+                                <div class="modal-info-section">
+                                    <div class="modal-info"><strong>Tanggal:</strong> <?= date('d/m/Y, H:i', strtotime($order['tanggal_order'])) ?></div>
+                                    <div class="modal-info"><strong>Tipe:</strong> <?= $order['tipe_order'] ?></div>
+                                    <?php if ($order['tipe_order'] === 'Dine In' && $order['nomor_meja']): ?>
+                                        <div class="modal-info"><strong>Meja:</strong> <?= htmlspecialchars($order['nomor_meja']) ?></div>
+                                    <?php endif; ?>
+                                    <div class="modal-info"><strong>Status:</strong> <?= htmlspecialchars($order['nama_status']) ?></div>
+                                </div>
 
-                            <div class="modal-items">
-                                <?php foreach ($details as $item): ?>
-                                    <div class="order-item">
-                                        <div class="item-name"><?= $item['jumlah'] ?>x <?= htmlspecialchars($item['nama_menu']) ?></div>
-                                        <div class="item-price">Rp. <?= number_format($item['harga_satuan'], 0, ',', '.') ?></div>
+                                <div class="modal-items">
+                                    <div class="order-title">Detail Pesanan</div>
+                                    <?php foreach ($details as $item): ?>
+                                        <div class="order-item">
+                                            <div class="item-name"><?= $item['jumlah'] ?>x <?= htmlspecialchars($item['nama_menu']) ?></div>
+                                            <div class="item-price">Rp <?= number_format($item['harga_satuan'], 0, ',', '.') ?></div>
+                                        </div>
+                                        <?php if (!empty($item['catatan'])): ?>
+                                            <div class="item-notes">Catatan: <?= htmlspecialchars($item['catatan']) ?></div>
+                                        <?php endif; ?>
+                                    <?php endforeach; ?>
+                                </div>
+
+                                <div class="total-section">
+                                    <div class="total-row">
+                                        <span>Subtotal</span>
+                                        <span>Rp <?= number_format($order['subtotal'], 0, ',', '.') ?></span>
                                     </div>
-                                <?php endforeach; ?>
-                            </div>
+                                    <?php if ($order['diskon'] > 0): ?>
+                                        <div class="total-row">
+                                            <span>Diskon</span>
+                                            <span>- Rp <?= number_format($order['diskon'], 0, ',', '.') ?></span>
+                                        </div>
+                                    <?php endif; ?>
+                                    <?php if ($order['pajak'] > 0): ?>
+                                        <div class="total-row">
+                                            <span>Pajak</span>
+                                            <span>Rp <?= number_format($order['pajak'], 0, ',', '.') ?></span>
+                                        </div>
+                                    <?php endif; ?>
+                                    <div class="total-price">
+                                        <span>Total</span>
+                                        <span>Rp <?= number_format($order['total'], 0, ',', '.') ?></span>
+                                    </div>
+                                </div>
 
-                            <div class="total-price">
-                                Rp. <?= number_format($order['total'], 0, ',', '.') ?>
-                            </div>
-
-                            <form method="POST" class="status-actions">
-                                <input type="hidden" name="action" value="update_status">
-                                <input type="hidden" name="order_id" value="<?= $order['id'] ?>">
-                                
-                                <?php if ($order['status_id'] == 1): ?>
-                                    <button type="submit" name="new_status_id" value="2" class="status-action-btn dimasak">
-                                        🍳 Dimasak
-                                    </button>
-                                    <button type="submit" name="new_status_id" value="3" class="status-action-btn siap">
-                                        🏠 Siap dihidangkan
-                                    </button>
-                                    <button type="submit" name="new_status_id" value="4" class="status-action-btn selesai">
-                                        ✓ Selesai
-                                    </button>
-                                <?php elseif ($order['status_id'] == 2): ?>
-                                    <button type="submit" name="new_status_id" value="3" class="status-action-btn siap">
-                                        🏠 Siap dihidangkan
-                                    </button>
-                                    <button type="submit" name="new_status_id" value="4" class="status-action-btn selesai">
-                                        ✓ Selesai
-                                    </button>
-                                <?php elseif ($order['status_id'] == 3): ?>
-                                    <button type="submit" name="new_status_id" value="4" class="status-action-btn selesai">
-                                        ✓ Selesai
-                                    </button>
+                                <?php if ($order['status_id'] < 4): ?>
+                                    <form method="POST" class="status-actions">
+                                        <input type="hidden" name="action" value="update_status">
+                                        <input type="hidden" name="order_id" value="<?= $order['id'] ?>">
+                                        <input type="hidden" name="old_status_id" value="<?= $order['status_id'] ?>">
+                                        
+                                        <?php if ($order['status_id'] == 1): ?>
+                                            <button type="submit" name="new_status_id" value="2" class="status-action-btn dimasak">
+                                                Mulai Masak
+                                            </button>
+                                            <button type="submit" name="new_status_id" value="3" class="status-action-btn siap">
+                                                Siap Hidang
+                                            </button>
+                                            <button type="submit" name="new_status_id" value="4" class="status-action-btn selesai">
+                                                Selesai
+                                            </button>
+                                        <?php elseif ($order['status_id'] == 2): ?>
+                                            <button type="submit" name="new_status_id" value="3" class="status-action-btn siap">
+                                                Siap Hidang
+                                            </button>
+                                            <button type="submit" name="new_status_id" value="4" class="status-action-btn selesai">
+                                                Selesai
+                                            </button>
+                                        <?php elseif ($order['status_id'] == 3): ?>
+                                            <button type="submit" name="new_status_id" value="4" class="status-action-btn selesai">
+                                                Selesai
+                                            </button>
+                                        <?php endif; ?>
+                                    </form>
                                 <?php endif; ?>
-                                
-                                <button type="button" class="status-action-btn btn-simpan" onclick="closeModal(<?= $order['id'] ?>)">
-                                    💾 Simpan
-                                </button>
-                            </form>
+                            </div>
                         </div>
                     </div>
                 <?php endforeach; ?>
@@ -811,10 +1009,12 @@ if ($order['status_id'] == 1) {
     <script>
         function showModal(orderId) {
             document.getElementById('modal-' + orderId).classList.add('active');
+            document.body.style.overflow = 'hidden';
         }
 
         function closeModal(orderId) {
             document.getElementById('modal-' + orderId).classList.remove('active');
+            document.body.style.overflow = 'auto';
         }
 
         // Search functionality
@@ -828,6 +1028,16 @@ if ($order['status_id'] == 1) {
                 });
             });
         }
+
+        // Close modal with Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.modal.active').forEach(modal => {
+                    modal.classList.remove('active');
+                    document.body.style.overflow = 'auto';
+                });
+            }
+        });
     </script>
 </body>
 </html>

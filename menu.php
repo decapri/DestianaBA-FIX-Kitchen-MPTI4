@@ -1,5 +1,20 @@
+
 <?php
 include 'config.php';
+
+// Initialize menu_varian data for drinks if not exists
+$init_query = "
+    INSERT IGNORE INTO menu_varian (menu_id, ukuran_id, harga, stok, aktif)
+    SELECT m.id, u.id, m.harga, 20, 1
+    FROM menu m
+    CROSS JOIN ukuran u
+    WHERE m.kategori_id = 1 AND m.aktif = 1
+    AND NOT EXISTS (
+        SELECT 1 FROM menu_varian mv 
+        WHERE mv.menu_id = m.id AND mv.ukuran_id = u.id
+    )
+";
+$koneksi->query($init_query);
 
 // Get filter
 $filter = isset($_GET['category']) ? $_GET['category'] : 'all';
@@ -19,11 +34,33 @@ $result = $koneksi->query($query);
 $menus = [];
 if ($result) {
     while ($row = $result->fetch_assoc()) {
+        // Get varian data for drinks
+        if ($row['kategori_id'] == 1) {
+            $varian_query = "SELECT mv.*, u.nama_ukuran 
+                            FROM menu_varian mv
+                            JOIN ukuran u ON mv.ukuran_id = u.id
+                            WHERE mv.menu_id = ? AND mv.aktif = 1
+                            ORDER BY u.id";
+            $stmt = $koneksi->prepare($varian_query);
+            $stmt->bind_param("i", $row['id']);
+            $stmt->execute();
+            $varian_result = $stmt->get_result();
+            
+            $row['varian'] = [];
+            while ($varian = $varian_result->fetch_assoc()) {
+                $row['varian'][$varian['nama_ukuran']] = [
+                    'id' => $varian['id'],
+                    'stok' => $varian['stok'],
+                    'harga' => $varian['harga']
+                ];
+            }
+            $stmt->close();
+        }
         $menus[] = $row;
     }
 }
 
-// Get categories
+// Get categories with counts
 $categories = [];
 $cat_result = $koneksi->query("SELECT * FROM kategori_menu ORDER BY urutan");
 if ($cat_result) {
@@ -95,6 +132,12 @@ if ($cat_result) {
             font-weight: 500;
         }
 
+        .nav-icon img {
+            width: 24px;
+            height: 24px;
+            filter: grayscale(100%) brightness(0) saturate(100%);
+        }
+
         .main-content {
             margin-left: 120px;
         }
@@ -110,6 +153,7 @@ if ($cat_result) {
             font-size: 48px;
             color: #3e2723;
             font-weight: 700;
+            margin-bottom: 5px;
         }
 
         .search-bar {
@@ -128,6 +172,7 @@ if ($cat_result) {
             align-items: center;
             justify-content: center;
             cursor: pointer;
+            position: relative;
             transition: all 0.3s;
         }
 
@@ -146,11 +191,12 @@ if ($cat_result) {
 
         .search-icon {
             position: absolute;
-            right: 10px;
+            right: 12px;
             top: 50%;
             transform: translateY(-50%);
             width: 20px;
             height: 20px;
+            filter: grayscale(100%) brightness(0) saturate(100%);
         }
 
         .categories {
@@ -251,7 +297,6 @@ if ($cat_result) {
             font-size: 16px;
         }
 
-        /* Size badges for drinks */
         .size-badges {
             display: flex;
             gap: 8px;
@@ -268,7 +313,6 @@ if ($cat_result) {
             font-weight: 600;
         }
 
-        /* Modal Styles */
         .modal {
             display: none;
             position: fixed;
@@ -327,7 +371,7 @@ if ($cat_result) {
             margin: 0;
             font-size: 24px;
             flex: 1;
-            margin-right: 12px; /* ensure close button doesn't overlap */
+            margin-right: 12px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -419,7 +463,6 @@ if ($cat_result) {
             font-weight: bold;
         }
 
-        /* Size selector for drinks */
         .size-section {
             background: #f8f8f8;
             padding: 15px;
@@ -523,9 +566,6 @@ if ($cat_result) {
             }
 
             .modal-content {
-                top: 50%;
-                left: 50%;
-                transform: translate(-50%, -50%);
                 width: 95%;
                 max-height: 85vh;
             }
@@ -533,31 +573,26 @@ if ($cat_result) {
     </style>
 </head>
 <body>
-    <div class="sidebar">
+        <div class="sidebar">
         <div class="nav-item logo">             
             <img src="assets/logo.png" alt="Kopi Janti" style="width: 70px; height: 70px;">
         </div>
         <a href="dashboard_kitchen.php" class="nav-item">
-            <img src="assets/Home.png" alt="Home" style="width: 20px; height: 20px;">
+            <div class="nav-icon"><img src="assets/Home.png" alt="Home"></div>
             <div class="nav-label">Home</div>
         </a>
-        <div class="nav-item active">
-            <img src="assets/menu.png" alt="Menu" style="width: 20px; height: 20px;">
+        <a href="menu.php" class="nav-item active">
+            <div class="nav-icon"><img src="assets/menu.png" alt="Menu"></div>
             <div class="nav-label">Menu</div>
-        </div>
-        <a href="history.php" class="nav-item">
-            <img src="assets/histori.png" alt="History" style="width: 20px; height: 20px;">
-            <div class="nav-label">History</div>
         </a>
         <a href="logout.php" class="nav-item end">
-            <img src="assets/logout.png" alt="Logout" style="width: 20px; height: 20px;">
-            <div class="nav-label">Log Out</div>
+            <div class="nav-icon"><img src="assets/logout.png" alt="Logout"></div>
+            <div class="nav-label">Logout</div>
         </a>
     </div>
-
     <div class="main-content">
         <div class="header">
-            <h1>Order List</h1>
+            <h1>Menu & Stok Management</h1>
             <div class="search-bar">
                 <button class="notification-btn">
                     <img src="assets/Bell.png" alt="Notifications" style="width: 20px; height: 20px;">
@@ -584,8 +619,8 @@ if ($cat_result) {
             <?php foreach ($menus as $menu): ?>
                 <div class="menu-card" onclick='openModal(<?= json_encode($menu, JSON_HEX_APOS | JSON_HEX_QUOT) ?>)'>
                     <div class="menu-image">
-                        <?php if (!empty($menu['gambar']) && file_exists('assets/' . $menu['gambar'])): ?>
-                            <img src="assets/<?= htmlspecialchars($menu['gambar']) ?>" alt="<?= htmlspecialchars($menu['nama_menu']) ?>">
+                        <?php if (!empty($menu['gambar'])): ?>
+                            <img src="<?= htmlspecialchars($menu['gambar']) ?>" alt="<?= htmlspecialchars($menu['nama_menu']) ?>" onerror="this.parentElement.innerHTML='<div style=\'font-size: 60px;\'>☕</div>'">
                         <?php else: ?>
                             <div style="font-size: 60px;">☕</div>
                         <?php endif; ?>
@@ -593,16 +628,22 @@ if ($cat_result) {
                     <div class="menu-info">
                         <div class="menu-name"><?= htmlspecialchars($menu['nama_menu']) ?></div>
                         <div class="menu-details">
-                            <?php if ($menu['kategori_id'] == 1): // Minuman ?>
+                            <?php if ($menu['kategori_id'] == 1 && !empty($menu['varian'])): ?>
                                 <div class="menu-stock">
                                     <div class="size-badges">
-                                        <span class="size-badge">S: <span class="stock-s-<?= $menu['id'] ?>"><?= $menu['stok_s'] ?? 0 ?></span></span>
-                                        <span class="size-badge">M: <span class="stock-m-<?= $menu['id'] ?>"><?= $menu['stok_m'] ?? 0 ?></span></span>
-                                        <span class="size-badge">L: <span class="stock-l-<?= $menu['id'] ?>"><?= $menu['stok_l'] ?? 0 ?></span></span>
+                                        <?php if (isset($menu['varian']['S'])): ?>
+                                            <span class="size-badge">S: <span class="stock-s-<?= $menu['id'] ?>"><?= $menu['varian']['S']['stok'] ?></span></span>
+                                        <?php endif; ?>
+                                        <?php if (isset($menu['varian']['M'])): ?>
+                                            <span class="size-badge">M: <span class="stock-m-<?= $menu['id'] ?>"><?= $menu['varian']['M']['stok'] ?></span></span>
+                                        <?php endif; ?>
+                                        <?php if (isset($menu['varian']['L'])): ?>
+                                            <span class="size-badge">L: <span class="stock-l-<?= $menu['id'] ?>"><?= $menu['varian']['L']['stok'] ?></span></span>
+                                        <?php endif; ?>
                                     </div>
                                 </div>
-                            <?php else: // Makanan ?>
-                                <div class="menu-stock">Sisa : <span class="stock-value-<?= $menu['id'] ?>"><?= $menu['stok'] ?></span> Porsi</div>
+                            <?php else: ?>
+                                <div class="menu-stock">Sisa: <span class="stock-value-<?= $menu['id'] ?>"><?= $menu['stok'] ?></span> Porsi</div>
                             <?php endif; ?>
                             <div class="menu-price">Rp<?= number_format($menu['harga'], 0, ',', '.') ?></div>
                         </div>
@@ -612,7 +653,6 @@ if ($cat_result) {
         </div>
     </div>
 
-    <!-- Modal Update Stok -->
     <div id="stockModal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
@@ -630,9 +670,11 @@ if ($cat_result) {
                         <input type="text" id="menuName" readonly>
                     </div>
 
-                    <!-- Form untuk Minuman (dengan ukuran) -->
                     <div id="drinkStockForm" style="display: none;">
-                        <!-- Small -->
+                        <input type="hidden" id="varianIdS" name="varian_id_s">
+                        <input type="hidden" id="varianIdM" name="varian_id_m">
+                        <input type="hidden" id="varianIdL" name="varian_id_l">
+                        
                         <div class="size-section">
                             <div class="size-header">
                                 <div class="size-label">
@@ -647,7 +689,6 @@ if ($cat_result) {
                             </div>
                         </div>
 
-                        <!-- Medium -->
                         <div class="size-section">
                             <div class="size-header">
                                 <div class="size-label">
@@ -662,7 +703,6 @@ if ($cat_result) {
                             </div>
                         </div>
 
-                        <!-- Large -->
                         <div class="size-section">
                             <div class="size-header">
                                 <div class="size-label">
@@ -679,7 +719,6 @@ if ($cat_result) {
                         <p class="info-text">Gunakan tombol +/- atau ketik langsung untuk mengubah stok per ukuran</p>
                     </div>
 
-                    <!-- Form untuk Makanan (tanpa ukuran) -->
                     <div id="foodStockForm" style="display: none;">
                         <div class="form-group">
                             <label>Stok Saat Ini</label>
@@ -704,35 +743,38 @@ if ($cat_result) {
     </div>
 
     <script>
-        let currentMenuData = null;
+function openModal(menuData) {
+    currentMenuData = menuData;
 
-        function openModal(menuData) {
-            currentMenuData = menuData;
-            document.getElementById('menuId').value = menuData.id;
-            document.getElementById('menuKategori').value = menuData.kategori_id;
-            document.getElementById('menuName').value = menuData.nama_menu;
-            document.getElementById('alertBox').style.display = 'none';
+    document.getElementById('menuId').value = menuData.id;
+    document.getElementById('menuKategori').value = menuData.kategori_id;
+    document.getElementById('menuName').value = menuData.nama_menu;
+    document.getElementById('alertBox').style.display = 'none';
 
-            // Check if drink (kategori_id = 1) or food
-            if (menuData.kategori_id == 1) {
-                // Show drink form with sizes
-                document.getElementById('drinkStockForm').style.display = 'block';
-                document.getElementById('foodStockForm').style.display = 'none';
-                
-                document.getElementById('stockS').value = menuData.stok_s || 0;
-                document.getElementById('stockM').value = menuData.stok_m || 0;
-                document.getElementById('stockL').value = menuData.stok_l || 0;
-            } else {
-                // Show food form without sizes
-                document.getElementById('drinkStockForm').style.display = 'none';
-                document.getElementById('foodStockForm').style.display = 'block';
-                
-                document.getElementById('currentStock').value = menuData.stok;
-                document.getElementById('newStock').value = menuData.stok;
-            }
+    if (menuData.kategori_id == 1) {
+        // === MINUMAN ===
+        document.getElementById('drinkStockForm').style.display = 'block';
+        document.getElementById('foodStockForm').style.display = 'none';
 
-            document.getElementById('stockModal').style.display = 'block';
-        }
+        document.getElementById('stockS').value =
+            menuData.varian?.S?.stok ?? 0;
+        document.getElementById('stockM').value =
+            menuData.varian?.M?.stok ?? 0;
+        document.getElementById('stockL').value =
+            menuData.varian?.L?.stok ?? 0;
+
+    } else {
+        // === MAKANAN ===
+        document.getElementById('drinkStockForm').style.display = 'none';
+        document.getElementById('foodStockForm').style.display = 'block';
+
+        document.getElementById('currentStock').value = menuData.stok;
+        document.getElementById('newStock').value = menuData.stok;
+    }
+
+    document.getElementById('stockModal').style.display = 'block';
+}
+
 
         function closeModal() {
             document.getElementById('stockModal').style.display = 'none';

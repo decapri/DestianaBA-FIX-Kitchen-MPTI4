@@ -2,7 +2,7 @@
 	$hostname	= "localhost"; 
 	$username	= "root"; 
 	$password	= ""; 
-	$database	= "kopi_janti"; 
+	$database	= "kopi_janti2"; 
 	$port		= 3307; // tambahkan ini
 
 	$koneksi	= new mysqli($hostname, $username, $password, $database, $port);

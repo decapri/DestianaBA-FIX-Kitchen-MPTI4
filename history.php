@@ -486,7 +486,7 @@ function getOrderDetails($koneksi, $order_id) {
                     <img src="assets/Search.png" alt="Search" style="width: 20px; height: 20px;">
                 </button>
                 <button type="button" class="btn-icon btn-filter">
-                    <span style="font-size: 20px;">⚙</span>
+                    <img src="assets/filter.png" alt="Search" style="width: 20px; height: 20px;">
                 </button>
             </div>
         </form>
